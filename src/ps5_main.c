@@ -32,6 +32,7 @@
  * Pairing: the menu's button, or create /data/anypad/pair.
  */
 #include "hci_usb.h"
+#include "usb_km_diag.h"
 #include "host.h"
 #include "lock.h"
 #include "log.h"
@@ -257,6 +258,7 @@ int main(void)
                ANYPAD_VERSION, WEB_PORT);
 
     sysinfo_log();
+    usb_km_diag_init();
 
     /* The entry in the media row that opens the menu in the browser. Done
      * before the credentials are raised for the pads, as Payload Manager does
@@ -287,6 +289,7 @@ int main(void)
         else usleep(4000);
         now = now_ms();
         web_poll(g_web);
+        usb_km_diag_poll(now);
         if (g_vpad_ok) vpad_poll(now);
 
         /* Rest mode on its way: leave cleanly before it, not after. */
@@ -319,6 +322,7 @@ int main(void)
     else if (g_stop && strcmp(why, "stop requested") == 0) why = "stop requested (flag or signal)";
 
     log_line("stopping: %s", why);
+    usb_km_diag_close();
     web_stop(g_web);
     host_close(g_host);                 /* our links; removes our virtual pads */
     g_host = NULL;
