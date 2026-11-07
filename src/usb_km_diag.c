@@ -46,6 +46,8 @@ static int g_count;
 static long g_scan_at;
 static long g_last_hint;
 static unsigned g_reports;
+static long g_capture_bytes;
+static int g_capture_limit_reached;
 static int g_capture_state = -1;
 static int g_no_hid_hint;
 static FILE *g_capture_log;
@@ -271,6 +273,17 @@ static void probe_hid_input_endpoints(void)
  * HID driver's polling, so the caller keeps the capture bounded and closes
  * these descriptors as soon as capture is disabled.
  */
+static void close_boot_endpoint_readers(void)
+{
+    int i;
+    for (i = 0; i < g_count; i++) {
+        if (g_nodes[i].keyboard_fd >= 0) close(g_nodes[i].keyboard_fd);
+        if (g_nodes[i].mouse_fd >= 0) close(g_nodes[i].mouse_fd);
+        g_nodes[i].keyboard_fd = -1;
+        g_nodes[i].mouse_fd = -1;
+    }
+}
+
 static void capture_boot_endpoint(km_node *node, unsigned ep,
     const char *role, int *fdp, int *attempted, int *budget)
 {
@@ -279,7 +292,8 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
     ssize_t got;
     int saved_errno;
 
-    if (ep == 0 || *budget <= 0) return;
+    if (ep == 0 || *budget <= 0 || !g_capture_log ||
+        g_capture_limit_reached) return;
     snprintf(path, sizeof path, "/dev/usb/%s.%u", node->name + 4, ep);
 
     if (*fdp < 0 && !*attempted) {
@@ -294,31 +308,23 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
 
     got = read(*fdp, data, sizeof data);
     if (got > 0) {
-        if (g_reports < 2048) {
-            size_t i;
-            long pos = g_capture_log ? ftell(g_capture_log) : -1;
-            if (g_capture_log && pos >= 0 && pos < MAX_CAPTURE_BYTES) {
-                fprintf(g_capture_log,
-                        "dev=%s role=%s endpoint=0x%02x path=%s len=%lu hex=",
-                        node->name, role, 0x80 | ep, path, (unsigned long)got);
-                for (i = 0; i < (size_t)got; i++)
-                    fprintf(g_capture_log, "%s%02x", i ? " " : "", data[i]);
-                fputc('\n', g_capture_log);
-                fflush(g_capture_log);
-            } else if (g_capture_log && pos >= MAX_CAPTURE_BYTES) {
-                close_capture_log();
-                log_line("km_diag: capture log reached its %ld-byte limit; stop capture",
-                         MAX_CAPTURE_BYTES);
-            }
-            if (g_reports == 0)
-                log_line("km_diag: first USB report received role=%s endpoint=0x%02x (%ld bytes)",
-                         role, 0x80 | ep, (long)got);
-            g_reports++;
-        } else if (g_reports == 2048) {
-            log_line("km_diag: report-count limit reached; remove capture flag");
-            g_reports++;
+        capture_log_report(node->name, role, 0x80 | ep, path,
+                           data, (size_t)got);
+        if (g_capture_limit_reached) {
+            close_boot_endpoint_readers();
+            return;
         }
+        if (g_reports == 0)
+            log_line("km_diag: first USB report received role=%s endpoint=0x%02x (%ld bytes)",
+                     role, 0x80 | ep, (long)got);
+        g_reports++;
         (*budget)--;
+        if (g_reports >= 2048) {
+            g_capture_limit_reached = 1;
+            log_line("km_diag: report-count limit reached; closing USB endpoint readers");
+            close_capture_log();
+            close_boot_endpoint_readers();
+        }
     } else if (got == 0 ||
                (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         saved_errno = got == 0 ? 0 : errno;
@@ -332,13 +338,14 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
 static void capture_boot_hid_reports(int *budget)
 {
     int i;
+    if (g_capture_limit_reached || !g_capture_log) return;
     for (i = 0; i < g_count && *budget > 0; i++) {
         km_node *node = &g_nodes[i];
         if (strncmp(node->name, "ugen", 4) != 0) continue;
         if (node->keyboard_ep)
             capture_boot_endpoint(node, node->keyboard_ep, "keyboard",
                 &node->keyboard_fd, &node->keyboard_attempted, budget);
-        if (*budget > 0 && node->mouse_ep)
+        if (!g_capture_limit_reached && *budget > 0 && node->mouse_ep)
             capture_boot_endpoint(node, node->mouse_ep, "mouse",
                 &node->mouse_fd, &node->mouse_attempted, budget);
     }
@@ -417,21 +424,44 @@ static void close_capture_log(void)
     g_capture_log = NULL;
 }
 
-static void capture_log_report(const char *dev, const unsigned char *data, size_t len)
+static void capture_log_report(const char *dev, const char *role,
+    unsigned endpoint, const char *path, const unsigned char *data, size_t len)
 {
-    size_t i;
-    long pos;
-    if (!g_capture_log) return;
-    pos = ftell(g_capture_log);
-    if (pos < 0 || pos >= MAX_CAPTURE_BYTES) {
+    char line[512];
+    size_t i, used;
+    int n;
+
+    if (!g_capture_log || g_capture_limit_reached) return;
+    n = snprintf(line, sizeof line,
+                 "dev=%s role=%s endpoint=0x%02x path=%s len=%lu hex=",
+                 dev, role, endpoint, path, (unsigned long)len);
+    if (n < 0 || (size_t)n >= sizeof line) return;
+    used = (size_t)n;
+    for (i = 0; i < len; i++) {
+        n = snprintf(line + used, sizeof line - used, "%s%02x",
+                     i ? " " : "", data[i]);
+        if (n < 0 || (size_t)n >= sizeof line - used) return;
+        used += (size_t)n;
+    }
+    if (used + 1 > sizeof line) return;
+    line[used++] = '\n';
+
+    if (g_capture_bytes < 0 ||
+        g_capture_bytes + (long)used > MAX_CAPTURE_BYTES) {
+        g_capture_limit_reached = 1;
         close_capture_log();
-        log_line("km_diag: capture log reached its %ld-byte limit; stop capture", MAX_CAPTURE_BYTES);
+        log_line("km_diag: capture log reached its %ld-byte limit; stopping endpoint reads",
+                 MAX_CAPTURE_BYTES);
         return;
     }
-    fprintf(g_capture_log, "dev=%s len=%lu hex=", dev, (unsigned long)len);
-    for (i = 0; i < len; i++) fprintf(g_capture_log, "%s%02x", i ? " " : "", data[i]);
-    fputc('\n', g_capture_log);
+    if (fwrite(line, 1, used, g_capture_log) != used) {
+        g_capture_limit_reached = 1;
+        close_capture_log();
+        log_line("km_diag: write to %s failed; stopping endpoint reads", CAPTURE_LOG);
+        return;
+    }
     fflush(g_capture_log);
+    g_capture_bytes += (long)used;
 }
 
 void usb_km_diag_init(void)
@@ -474,11 +504,23 @@ void usb_km_diag_poll(long now)
         g_capture_state = capture;
         list_capture_files();
         if (capture) {
+            g_reports = 0;
+            g_capture_bytes = 0;
+            g_capture_limit_reached = 0;
             g_capture_log = fopen(CAPTURE_LOG, "a");
-            if (!g_capture_log)
+            if (!g_capture_log) {
                 log_line("km_diag: cannot open %s errno=%d", CAPTURE_LOG, errno);
-            else
+            } else {
+                if (fseek(g_capture_log, 0, SEEK_END) == 0)
+                    g_capture_bytes = ftell(g_capture_log);
                 log_line("km_diag: raw report output is %s", CAPTURE_LOG);
+                if (g_capture_bytes < 0 || g_capture_bytes >= MAX_CAPTURE_BYTES) {
+                    g_capture_limit_reached = 1;
+                    close_capture_log();
+                    log_line("km_diag: existing capture log is at its %ld-byte limit",
+                             MAX_CAPTURE_BYTES);
+                }
+            }
         } else {
             close_capture_log();
         }
@@ -521,6 +563,7 @@ void usb_km_diag_poll(long now)
     }
 
     capture_boot_hid_reports(&budget);
+    if (g_capture_limit_reached || !g_capture_log) return;
 
     for (i = 0; i < g_count && budget > 0; i++) {
         km_node *n = &g_nodes[i];
@@ -540,7 +583,8 @@ void usb_km_diag_poll(long now)
         got = read(n->fd, data, sizeof data);
         if (got > 0) {
             if (g_reports < 2048) {
-                capture_log_report(n->name, data, (size_t)got);
+                capture_log_report(n->name, "legacy", 0, "/dev/legacy",
+                                   data, (size_t)got);
                 if (g_reports == 0)
                     log_line("km_diag: first raw report received from %s (%ld bytes)",
                              n->name, (long)got);
