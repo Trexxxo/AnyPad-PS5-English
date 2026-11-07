@@ -52,6 +52,8 @@ static int g_capture_state = -1;
 static int g_no_hid_hint;
 static FILE *g_capture_log;
 
+static void close_capture_log(void);
+
 static int interesting(const char *name)
 {
     return strncmp(name, "ugen", 4) == 0 ||
@@ -210,9 +212,9 @@ static void list_ugen_endpoint_nodes(const char *name)
         if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0) continue;
         snprintf(path, sizeof path, "/dev/usb/%s", entry->d_name);
         if (lstat(path, &st) != 0) continue;
-        target[0] = '\\0';
+        target[0] = '\0';
         n = readlink(path, target, sizeof target - 1);
-        if (n > 0) target[n] = '\\0';
+        if (n > 0) target[n] = '\0';
         have_target = stat(path, &target_st) == 0;
         log_line("km_diag: endpoint-node %s type=%s mode=%04o target=%s target_mode=%04o",
                  path, S_ISLNK(st.st_mode) ? "symlink" :
