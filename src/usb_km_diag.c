@@ -82,7 +82,6 @@ static void inspect_ugen(km_node *node)
     char path[80];
     int fd, iface_index = 0, current_hid = 0;
     int current_hid_sub = 0, current_hid_proto = 0, off, total;
-    unsigned hid_in_mask = 0;
     struct usb_device_descriptor dd;
     struct usb_device_info di;
     struct usb_gen_descriptor gd;
@@ -361,9 +360,11 @@ static void scan_nodes(void)
         memset(node, 0, sizeof *node);
         snprintf(node->name, sizeof node->name, "%s", entry->d_name);
         node->fd = -1;
+        node->keyboard_fd = -1;
+        node->mouse_fd = -1;
         log_line("km_diag: USB node /dev/%s discovered", node->name);
         if (strncmp(node->name, "ugen", 4) == 0) {
-            node->hid_in_mask = inspect_ugen(node->name);
+            inspect_ugen(node);
             list_ugen_endpoint_nodes(node->name);
         }
     }
@@ -561,8 +562,11 @@ void usb_km_diag_poll(long now)
 void usb_km_diag_close(void)
 {
     int i;
-    for (i = 0; i < g_count; i++)
+    for (i = 0; i < g_count; i++) {
         if (g_nodes[i].fd >= 0) close(g_nodes[i].fd);
+        if (g_nodes[i].keyboard_fd >= 0) close(g_nodes[i].keyboard_fd);
+        if (g_nodes[i].mouse_fd >= 0) close(g_nodes[i].mouse_fd);
+    }
     close_capture_log();
     log_line("km_diag: stopped, captured %u reports", g_reports);
 }
