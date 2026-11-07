@@ -33,6 +33,12 @@ typedef struct {
     int attempted;
     unsigned hid_in_mask;
     int endpoint_probe_attempted;
+    unsigned keyboard_ep;
+    unsigned mouse_ep;
+    int keyboard_fd;
+    int mouse_fd;
+    int keyboard_attempted;
+    int mouse_attempted;
 } km_node;
 
 static km_node g_nodes[MAX_NODES];
@@ -70,10 +76,12 @@ static int find_node(const char *name)
 /* USB_GET_DEVICEINFO / USB_GET_FULL_DESC are read-only queries. They let us
  * distinguish actual HID interfaces from the generic ugen device nodes.
  */
-static unsigned inspect_ugen(const char *name)
+static void inspect_ugen(km_node *node)
 {
+    const char *name = node->name;
     char path[80];
-    int fd, iface_index = 0, current_hid = 0, off, total;
+    int fd, iface_index = 0, current_hid = 0;
+    int current_hid_sub = 0, current_hid_proto = 0, off, total;
     unsigned hid_in_mask = 0;
     struct usb_device_descriptor dd;
     struct usb_device_info di;
@@ -84,7 +92,7 @@ static unsigned inspect_ugen(const char *name)
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         log_line("km_diag: descriptor open %s failed errno=%d", path, errno);
-        return 0;
+        return;
     }
 
     memset(&dd, 0, sizeof dd);
@@ -112,7 +120,7 @@ static unsigned inspect_ugen(const char *name)
     if (ioctl(fd, USB_GET_FULL_DESC, &gd) != 0) {
         log_line("km_diag: USB_GET_FULL_DESC %s failed errno=%d", name, errno);
         close(fd);
-        return 0;
+        return;
     }
 
     total = gd.ugd_actlen < (int)sizeof cfg ? gd.ugd_actlen : (int)sizeof cfg;
@@ -133,6 +141,8 @@ static unsigned inspect_ugen(const char *name)
             struct usb_gen_descriptor id;
 
             current_hid = cls == 0x03;
+            current_hid_sub = sub;
+            current_hid_proto = proto;
             log_line("km_diag: interface dev=%s index=%d number=%d class=%02x subclass=%02x protocol=%02x endpoints=%u%s",
                      name, iface_index, number, cls, sub, proto, cfg[off + 4],
                      current_hid ? " HID" : "");
@@ -155,13 +165,20 @@ static unsigned inspect_ugen(const char *name)
             log_line("km_diag: HID endpoint dev=%s address=%02x transfer=%u max_packet=%u interval=%u",
                      name, addr, attr, mps, cfg[off + 6]);
             /* Only probe interrupt-IN endpoints belonging to HID interfaces. */
-            if ((addr & 0x80) && attr == 3 && (addr & 0x0f) != 0)
-                hid_in_mask |= 1u << (addr & 0x0f);
+            if ((addr & 0x80) && attr == 3 && (addr & 0x0f) != 0) {
+                unsigned ep = addr & 0x0f;
+                node->hid_in_mask |= 1u << ep;
+                if (current_hid_sub == 1 && current_hid_proto == 2 &&
+                    node->keyboard_ep == 0)
+                    node->keyboard_ep = ep;
+                if (current_hid_sub == 1 && current_hid_proto == 1 &&
+                    node->mouse_ep == 0)
+                    node->mouse_ep = ep;
+            }
         }
         off += len;
     }
     close(fd);
-    return hid_in_mask;
 }
 
 /* FreeBSD exposes endpoint nodes under /dev/usb/X.Y.N. Inventory them
@@ -247,6 +264,84 @@ static void probe_hid_input_endpoints(void)
                          node->name, 0x80 | ep, path, saved_errno);
             }
         }
+    }
+}
+
+/* Read only the standard boot keyboard and boot mouse interfaces.
+ * The marker file is an explicit opt-in. Reads can compete with the system
+ * HID driver's polling, so the caller keeps the capture bounded and closes
+ * these descriptors as soon as capture is disabled.
+ */
+static void capture_boot_endpoint(km_node *node, unsigned ep,
+    const char *role, int *fdp, int *attempted, int *budget)
+{
+    char path[128];
+    unsigned char data[MAX_REPORT];
+    ssize_t got;
+    int saved_errno;
+
+    if (ep == 0 || *budget <= 0) return;
+    snprintf(path, sizeof path, "/dev/usb/%s.%u", node->name + 4, ep);
+
+    if (*fdp < 0 && !*attempted) {
+        *fdp = open(path, O_RDONLY | O_NONBLOCK);
+        saved_errno = *fdp < 0 ? errno : 0;
+        *attempted = 1;
+        log_line("km_diag: report-read open role=%s dev=%s endpoint=0x%02x path=%s %s errno=%d",
+                 role, node->name, 0x80 | ep, path,
+                 *fdp >= 0 ? "OK" : "FAILED", saved_errno);
+    }
+    if (*fdp < 0) return;
+
+    got = read(*fdp, data, sizeof data);
+    if (got > 0) {
+        if (g_reports < 2048) {
+            size_t i;
+            long pos = g_capture_log ? ftell(g_capture_log) : -1;
+            if (g_capture_log && pos >= 0 && pos < MAX_CAPTURE_BYTES) {
+                fprintf(g_capture_log,
+                        "dev=%s role=%s endpoint=0x%02x path=%s len=%lu hex=",
+                        node->name, role, 0x80 | ep, path, (unsigned long)got);
+                for (i = 0; i < (size_t)got; i++)
+                    fprintf(g_capture_log, "%s%02x", i ? " " : "", data[i]);
+                fputc('\\n', g_capture_log);
+                fflush(g_capture_log);
+            } else if (g_capture_log && pos >= MAX_CAPTURE_BYTES) {
+                close_capture_log();
+                log_line("km_diag: capture log reached its %ld-byte limit; stop capture",
+                         MAX_CAPTURE_BYTES);
+            }
+            if (g_reports == 0)
+                log_line("km_diag: first USB report received role=%s endpoint=0x%02x (%ld bytes)",
+                         role, 0x80 | ep, (long)got);
+            g_reports++;
+        } else if (g_reports == 2048) {
+            log_line("km_diag: report-count limit reached; remove capture flag");
+            g_reports++;
+        }
+        (*budget)--;
+    } else if (got == 0 ||
+               (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        saved_errno = got == 0 ? 0 : errno;
+        log_line("km_diag: report-read role=%s endpoint=0x%02x returned=%ld errno=%d; closing",
+                 role, 0x80 | ep, (long)got, saved_errno);
+        close(*fdp);
+        *fdp = -1;
+    }
+}
+
+static void capture_boot_hid_reports(int *budget)
+{
+    int i;
+    for (i = 0; i < g_count && *budget > 0; i++) {
+        km_node *node = &g_nodes[i];
+        if (strncmp(node->name, "ugen", 4) != 0) continue;
+        if (node->keyboard_ep)
+            capture_boot_endpoint(node, node->keyboard_ep, "keyboard",
+                &node->keyboard_fd, &node->keyboard_attempted, budget);
+        if (*budget > 0 && node->mouse_ep)
+            capture_boot_endpoint(node, node->mouse_ep, "mouse",
+                &node->mouse_fd, &node->mouse_attempted, budget);
     }
 }
 
@@ -341,8 +436,11 @@ static void capture_log_report(const char *dev, const unsigned char *data, size_
 void usb_km_diag_init(void)
 {
     int i;
-    for (i = 0; i < g_count; i++)
+    for (i = 0; i < g_count; i++) {
         if (g_nodes[i].fd >= 0) close(g_nodes[i].fd);
+        if (g_nodes[i].keyboard_fd >= 0) close(g_nodes[i].keyboard_fd);
+        if (g_nodes[i].mouse_fd >= 0) close(g_nodes[i].mouse_fd);
+    }
     close_capture_log();
     memset(g_nodes, 0, sizeof g_nodes);
     g_count = 0;
@@ -388,8 +486,14 @@ void usb_km_diag_poll(long now)
     if (!capture) {
         for (i = 0; i < g_count; i++) {
             if (g_nodes[i].fd >= 0) close(g_nodes[i].fd);
+            if (g_nodes[i].keyboard_fd >= 0) close(g_nodes[i].keyboard_fd);
+            if (g_nodes[i].mouse_fd >= 0) close(g_nodes[i].mouse_fd);
             g_nodes[i].fd = -1;
+            g_nodes[i].keyboard_fd = -1;
+            g_nodes[i].mouse_fd = -1;
             g_nodes[i].attempted = 0;
+            g_nodes[i].keyboard_attempted = 0;
+            g_nodes[i].mouse_attempted = 0;
             g_nodes[i].endpoint_probe_attempted = 0;
         }
         if (now - g_last_hint >= 30000) {
@@ -414,6 +518,8 @@ void usb_km_diag_poll(long now)
             g_no_hid_hint = 1;
         }
     }
+
+    capture_boot_hid_reports(&budget);
 
     for (i = 0; i < g_count && budget > 0; i++) {
         km_node *n = &g_nodes[i];
