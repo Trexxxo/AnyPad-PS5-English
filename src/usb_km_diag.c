@@ -39,6 +39,10 @@ typedef struct {
     int mouse_fd;
     int keyboard_attempted;
     int mouse_attempted;
+    unsigned keyboard_zero_reads;
+    unsigned mouse_zero_reads;
+    unsigned keyboard_wait_reads;
+    unsigned mouse_wait_reads;
 } km_node;
 
 static km_node g_nodes[MAX_NODES];
@@ -289,7 +293,8 @@ static void close_boot_endpoint_readers(void)
 }
 
 static void capture_boot_endpoint(km_node *node, unsigned ep,
-    const char *role, int *fdp, int *attempted, int *budget)
+    const char *role, int *fdp, int *attempted, int *budget,
+    unsigned *zero_reads, unsigned *wait_reads)
 {
     char path[128];
     unsigned char data[MAX_REPORT];
@@ -322,6 +327,8 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
             log_line("km_diag: first USB report received role=%s endpoint=0x%02x (%ld bytes)",
                      role, 0x80 | ep, (long)got);
         g_reports++;
+        *zero_reads = 0;
+        *wait_reads = 0;
         (*budget)--;
         if (g_reports >= 2048) {
             g_capture_limit_reached = 1;
@@ -329,11 +336,28 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
             close_capture_log();
             close_boot_endpoint_readers();
         }
-    } else if (got == 0 ||
-               (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-        saved_errno = got == 0 ? 0 : errno;
-        log_line("km_diag: report-read role=%s endpoint=0x%02x returned=%ld errno=%d; closing",
-                 role, 0x80 | ep, (long)got, saved_errno);
+    } else if (got == 0) {
+        /*
+         * FreeBSD ugen can queue a zero-length record when an interrupt
+         * transfer completes with an error, while its clear-stall transfer
+         * is being processed. Closing immediately can cancel that recovery.
+         * Keep the reader alive and record the event; PS5's kernel may differ.
+         */
+        (*zero_reads)++;
+        if (*zero_reads == 1 || (*zero_reads % 32) == 0) {
+            log_line("km_diag: report-read role=%s endpoint=0x%02x returned=0; keeping reader open (zero_reads=%u)",
+                     role, 0x80 | ep, *zero_reads);
+        }
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        (*wait_reads)++;
+        if (*wait_reads == 1 || (*wait_reads % 256) == 0) {
+            log_line("km_diag: report-read role=%s endpoint=0x%02x no data yet (EAGAIN, polls=%u)",
+                     role, 0x80 | ep, *wait_reads);
+        }
+    } else if (errno != EINTR) {
+        saved_errno = errno;
+        log_line("km_diag: report-read role=%s endpoint=0x%02x failed errno=%d; closing",
+                 role, 0x80 | ep, saved_errno);
         close(*fdp);
         *fdp = -1;
     }
@@ -348,10 +372,12 @@ static void capture_boot_hid_reports(int *budget)
         if (strncmp(node->name, "ugen", 4) != 0) continue;
         if (node->keyboard_ep)
             capture_boot_endpoint(node, node->keyboard_ep, "keyboard",
-                &node->keyboard_fd, &node->keyboard_attempted, budget);
+                &node->keyboard_fd, &node->keyboard_attempted, budget,
+                &node->keyboard_zero_reads, &node->keyboard_wait_reads);
         if (!g_capture_limit_reached && *budget > 0 && node->mouse_ep)
             capture_boot_endpoint(node, node->mouse_ep, "mouse",
-                &node->mouse_fd, &node->mouse_attempted, budget);
+                &node->mouse_fd, &node->mouse_attempted, budget,
+                &node->mouse_zero_reads, &node->mouse_wait_reads);
     }
 }
 
@@ -511,6 +537,12 @@ void usb_km_diag_poll(long now)
             g_reports = 0;
             g_capture_bytes = 0;
             g_capture_limit_reached = 0;
+            for (i = 0; i < g_count; i++) {
+                g_nodes[i].keyboard_zero_reads = 0;
+                g_nodes[i].mouse_zero_reads = 0;
+                g_nodes[i].keyboard_wait_reads = 0;
+                g_nodes[i].mouse_wait_reads = 0;
+            }
             g_capture_log = fopen(CAPTURE_LOG, "a");
             if (!g_capture_log) {
                 log_line("km_diag: cannot open %s errno=%d", CAPTURE_LOG, errno);
