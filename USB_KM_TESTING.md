@@ -8,14 +8,14 @@ This is a **USB discovery and diagnostics build**, not yet keyboard/mouse-to-Dua
 
 1. Download the `anypad-usb-km-diagnostic-elf` artifact from the GitHub Actions workflow and load the ELF as usual.
 2. Connect the keyboard and mouse directly to the PS5. Test a few harmless keys (W/A/S/D, Shift, Ctrl) and mouse movement.
-3. Read `/data/anypad/anypad.log` via FTP. Find lines beginning `km_diag:`. The diagnostic scans `/dev` every two seconds and inspects descriptors for each `ugen*` device.
+3. Read `/data/anypad/anypad.log` via FTP. Find lines beginning `km_diag:`. The diagnostic scans `/dev` every two seconds, inspects descriptors for each `ugen*` device, and inventories matching endpoint nodes under `/dev/usb/`. It does not open or read those endpoint nodes yet; the PS5 reports the interfaces as owned by `usb_hid0`–`usb_hid3`, so we are verifying the endpoint-node layout before attempting any input reads.
 4. To enable optional raw report capture, create an **empty regular file** at `/data/anypad/km_capture`. For convenience, `/data/anypad/km_capture.txt` is also accepted. Do not use `km_capture.log` as the trigger: that is the **output file**.
 5. With the trigger present, press a few harmless keys and move/click the mouse for 10–15 seconds. Remove the trigger file to stop capture.
 6. Download and share:
    - `/data/anypad/anypad.log` — USB device IDs, interface classes, endpoints, kernel-driver names, capture status/errors.
    - `/data/anypad/km_capture.log` — raw reports, if the PS5 exposes readable `ukbd*`, `ums*`, or `uhid*` device nodes and capture succeeds.
 
-The raw capture is deliberately bounded (maximum 2,048 reports and 256 KiB). If only generic `ugen*` nodes exist, this build can still identify HID interfaces from descriptors but cannot read their reports through the character-device backend. That result is useful: it tells us we need a different backend (for example, a supported system keyboard API or a carefully validated USB endpoint reader).
+The raw capture is deliberately bounded (maximum 2,048 reports and 256 KiB). On the GameSir VXKB seen in the current test, the kernel binds the interfaces to `usb_hid0`–`usb_hid3`, not `ukbd*`, `ums*`, or `uhid*`. In that case `km_capture.log` is expected to remain empty. The next diagnostic output to inspect is the `endpoint-node` inventory in `anypad.log`; endpoint reads are intentionally disabled until we confirm the device-node mapping and avoid interfering with the system HID driver.
 
 ## Privacy and safety
 
