@@ -303,7 +303,7 @@ static void capture_boot_endpoint(km_node *node, unsigned ep,
                         node->name, role, 0x80 | ep, path, (unsigned long)got);
                 for (i = 0; i < (size_t)got; i++)
                     fprintf(g_capture_log, "%s%02x", i ? " " : "", data[i]);
-                fputc('\\n', g_capture_log);
+                fputc('\n', g_capture_log);
                 fflush(g_capture_log);
             } else if (g_capture_log && pos >= MAX_CAPTURE_BYTES) {
                 close_capture_log();
