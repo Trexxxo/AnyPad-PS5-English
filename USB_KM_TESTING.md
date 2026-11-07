@@ -2,33 +2,28 @@
 
 Branch: `feature/usb-kbm-diagnostics`
 
-This is the **first hardware discovery build**, not yet keyboard/mouse-to-DualSense support. It deliberately does not detach USB interfaces or write to them. Existing Bluetooth pad behavior is unchanged.
+This is a **USB discovery and diagnostics build**, not yet keyboard/mouse-to-DualSense support. It reads USB device/configuration descriptors but does not detach drivers, claim interfaces, or send USB commands. Existing Bluetooth pad behavior is unchanged.
 
 ## Testing on a PS5
 
 1. Download the `anypad-usb-km-diagnostic-elf` artifact from the GitHub Actions workflow and load the ELF as usual.
-2. Connect a standard USB keyboard and USB mouse to the PS5.
-3. Read `/data/anypad/anypad.log` via FTP. Find lines beginning `km_diag:`.
-4. The diagnostic scans `/dev` every two seconds and lists nodes beginning `ugen`, `ukbd`, `ums`, and `uhid`.
-5. **Optional raw report probe:** create the empty file `/data/anypad/km_capture` and then press a few *non-sensitive test keys* and move the mouse for 10–15 seconds. Delete the flag immediately after testing. The payload will attempt nonblocking read-only opens on `ukbd`, `ums`, and `uhid` nodes and log up to 32 bytes per report.
-6. Share only the `km_diag:` lines, redacting anything you consider sensitive. A report is not guaranteed: PS5 may expose keyboard/mouse through a different interface, or the OS may already own its HID endpoints.
+2. Connect the keyboard and mouse directly to the PS5. Test a few harmless keys (W/A/S/D, Shift, Ctrl) and mouse movement.
+3. Read `/data/anypad/anypad.log` via FTP. Find lines beginning `km_diag:`. The diagnostic scans `/dev` every two seconds and inspects descriptors for each `ugen*` device.
+4. To enable optional raw report capture, create an **empty regular file** at `/data/anypad/km_capture`. For convenience, `/data/anypad/km_capture.txt` is also accepted. Do not use `km_capture.log` as the trigger: that is the **output file**.
+5. With the trigger present, press a few harmless keys and move/click the mouse for 10–15 seconds. Remove the trigger file to stop capture.
+6. Download and share:
+   - `/data/anypad/anypad.log` — USB device IDs, interface classes, endpoints, kernel-driver names, capture status/errors.
+   - `/data/anypad/km_capture.log` — raw reports, if the PS5 exposes readable `ukbd*`, `ums*`, or `uhid*` device nodes and capture succeeds.
 
-**Privacy:** Raw keyboard reports can reveal what was typed. Do not enter passwords, messages, or personal information while `km_capture` is present. The log is local and follows AnyPad's existing 1 MiB rotation policy. Capturing input from a shared keyboard node can affect normal input, so enable it only for the short diagnostic test.
+The raw capture is deliberately bounded (maximum 2,048 reports and 256 KiB). If only generic `ugen*` nodes exist, this build can still identify HID interfaces from descriptors but cannot read their reports through the character-device backend. That result is useful: it tells us we need a different backend (for example, a supported system keyboard API or a carefully validated USB endpoint reader).
 
-**Stop:** delete `/data/anypad/km_capture` to stop raw reads; stop the payload from its normal dashboard or `/data/anypad/stop`.
+## Privacy and safety
 
-## Expected log examples
+Raw keyboard reports can reveal typed keys. Do not enter passwords, messages, or personal information while capture is enabled. Capture is opt-in and read-only. The payload does not detach USB drivers or claim HID interfaces. Remove the trigger immediately after the short test.
 
-```text
-km_diag: USB discovery enabled; raw HID reads disabled by default
-km_diag: USB node /dev/ugen0.2 discovered
-km_diag: 3 USB-related nodes; raw capture OFF
-km_diag: open /dev/uhid0 FAILED errno=...
-km_diag: report dev=uhid0 len=8 hex=...
-```
+**Stop:** delete `/data/anypad/km_capture` (or `km_capture.txt`) to stop raw reads; stop the payload from its normal dashboard or `/data/anypad/stop`.
 
-These are **examples**, not confirmed console results.
+## What to send back
 
-## Next implementation milestone
+Please share all `km_diag:` lines from `anypad.log`, plus `km_capture.log` if it was created and contains reports. Redact any report bytes you do not want to share.
 
-Use the log to select a functioning input backend (native SceKeyboard/SceMouse APIs or USB HID). Once key and relative mouse events are verified, implement a mapping layer that feeds AnyPad's existing `pad_state` and virtual DualSense path. Right-stick translation will need calibration for per-game turn-speed caps and deadzones.
