@@ -31,6 +31,8 @@ typedef struct {
     char name[64];
     int fd;
     int attempted;
+    unsigned hid_in_mask;
+    int endpoint_probe_attempted;
 } km_node;
 
 static km_node g_nodes[MAX_NODES];
@@ -68,10 +70,11 @@ static int find_node(const char *name)
 /* USB_GET_DEVICEINFO / USB_GET_FULL_DESC are read-only queries. They let us
  * distinguish actual HID interfaces from the generic ugen device nodes.
  */
-static void inspect_ugen(const char *name)
+static unsigned inspect_ugen(const char *name)
 {
     char path[80];
     int fd, iface_index = 0, current_hid = 0, off, total;
+    unsigned hid_in_mask = 0;
     struct usb_device_descriptor dd;
     struct usb_device_info di;
     struct usb_gen_descriptor gd;
@@ -81,7 +84,7 @@ static void inspect_ugen(const char *name)
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         log_line("km_diag: descriptor open %s failed errno=%d", path, errno);
-        return;
+        return 0;
     }
 
     memset(&dd, 0, sizeof dd);
@@ -109,7 +112,7 @@ static void inspect_ugen(const char *name)
     if (ioctl(fd, USB_GET_FULL_DESC, &gd) != 0) {
         log_line("km_diag: USB_GET_FULL_DESC %s failed errno=%d", name, errno);
         close(fd);
-        return;
+        return 0;
     }
 
     total = gd.ugd_actlen < (int)sizeof cfg ? gd.ugd_actlen : (int)sizeof cfg;
@@ -151,16 +154,19 @@ static void inspect_ugen(const char *name)
             unsigned mps = cfg[off + 4] | (cfg[off + 5] << 8);
             log_line("km_diag: HID endpoint dev=%s address=%02x transfer=%u max_packet=%u interval=%u",
                      name, addr, attr, mps, cfg[off + 6]);
+            /* Only probe interrupt-IN endpoints belonging to HID interfaces. */
+            if ((addr & 0x80) && attr == 3 && (addr & 0x0f) != 0)
+                hid_in_mask |= 1u << (addr & 0x0f);
         }
         off += len;
     }
     close(fd);
+    return hid_in_mask;
 }
 
-/* FreeBSD exposes the control endpoint as /dev/ugenX.Y and endpoint
- * nodes under /dev/usb/X.Y.N. Inventory those nodes without opening them:
- * Sony's usb_hid driver owns these interfaces, so endpoint reads stay off
- * until we confirm which nodes can be accessed without disturbing it.
+/* FreeBSD exposes endpoint nodes under /dev/usb/X.Y.N. Inventory them
+ * without opening them during discovery. Opening is an explicit, opt-in
+ * diagnostic below; it never reads reports or detaches/claims a driver.
  */
 static void list_ugen_endpoint_nodes(const char *name)
 {
@@ -201,6 +207,49 @@ static void list_ugen_endpoint_nodes(const char *name)
     log_line("km_diag: endpoint-node inventory %s: %d matching nodes", name, found);
 }
 
+/* Opening an interrupt-IN endpoint is the smallest useful access test:
+ * it tells us whether the generic endpoint node is accessible while Sony's
+ * usb_hid driver is attached. Do not read from it yet; a read could consume
+ * reports that the system HID driver expects.
+ */
+static void probe_hid_input_endpoints(void)
+{
+    int i, ep;
+
+    for (i = 0; i < g_count; i++) {
+        km_node *node = &g_nodes[i];
+
+        if (strncmp(node->name, "ugen", 4) != 0 ||
+            node->endpoint_probe_attempted)
+            continue;
+
+        node->endpoint_probe_attempted = 1;
+        if (!node->hid_in_mask) {
+            log_line("km_diag: endpoint-open probe %s: no HID interrupt-IN endpoints",
+                     node->name);
+            continue;
+        }
+
+        for (ep = 1; ep < 16; ep++) {
+            char path[128];
+            int fd, saved_errno;
+
+            if (!(node->hid_in_mask & (1u << ep))) continue;
+            snprintf(path, sizeof path, "/dev/usb/%s.%d", node->name + 4, ep);
+            fd = open(path, O_RDONLY | O_NONBLOCK);
+            saved_errno = fd < 0 ? errno : 0;
+            if (fd >= 0) {
+                log_line("km_diag: endpoint-open probe dev=%s endpoint=0x%02x path=%s OK (open-only; no read)",
+                         node->name, 0x80 | ep, path);
+                close(fd);
+            } else {
+                log_line("km_diag: endpoint-open probe dev=%s endpoint=0x%02x path=%s FAILED errno=%d",
+                         node->name, 0x80 | ep, path, saved_errno);
+            }
+        }
+    }
+}
+
 static void scan_nodes(void)
 {
     DIR *dir = opendir("/dev");
@@ -219,7 +268,7 @@ static void scan_nodes(void)
         node->fd = -1;
         log_line("km_diag: USB node /dev/%s discovered", node->name);
         if (strncmp(node->name, "ugen", 4) == 0) {
-            inspect_ugen(node->name);
+            node->hid_in_mask = inspect_ugen(node->name);
             list_ugen_endpoint_nodes(node->name);
         }
     }
@@ -341,6 +390,7 @@ void usb_km_diag_poll(long now)
             if (g_nodes[i].fd >= 0) close(g_nodes[i].fd);
             g_nodes[i].fd = -1;
             g_nodes[i].attempted = 0;
+            g_nodes[i].endpoint_probe_attempted = 0;
         }
         if (now - g_last_hint >= 30000) {
             log_line("km_diag: %d USB-related nodes; capture OFF (flag not found; errno=%d)",
@@ -350,6 +400,9 @@ void usb_km_diag_poll(long now)
         }
         return;
     }
+
+    /* Capture must be explicitly enabled before endpoint nodes are opened. */
+    probe_hid_input_endpoints();
 
     {
         int candidates = 0;
