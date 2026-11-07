@@ -53,6 +53,8 @@ static int g_no_hid_hint;
 static FILE *g_capture_log;
 
 static void close_capture_log(void);
+static void capture_log_report(const char *dev, const char *role,
+    unsigned endpoint, const char *path, const unsigned char *data, size_t len);
 
 static int interesting(const char *name)
 {
