@@ -157,6 +157,50 @@ static void inspect_ugen(const char *name)
     close(fd);
 }
 
+/* FreeBSD exposes the control endpoint as /dev/ugenX.Y and endpoint
+ * nodes under /dev/usb/X.Y.N. Inventory those nodes without opening them:
+ * Sony's usb_hid driver owns these interfaces, so endpoint reads stay off
+ * until we confirm which nodes can be accessed without disturbing it.
+ */
+static void list_ugen_endpoint_nodes(const char *name)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char prefix[64];
+    int found = 0;
+
+    if (strncmp(name, "ugen", 4) != 0) return;
+    snprintf(prefix, sizeof prefix, "%s.", name + 4);
+    dir = opendir("/dev/usb");
+    if (!dir) {
+        log_line("km_diag: endpoint-node directory /dev/usb unavailable errno=%d", errno);
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char path[128], target[128];
+        struct stat st, target_st;
+        ssize_t n;
+        int have_target;
+
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0) continue;
+        snprintf(path, sizeof path, "/dev/usb/%s", entry->d_name);
+        if (lstat(path, &st) != 0) continue;
+        target[0] = '\\0';
+        n = readlink(path, target, sizeof target - 1);
+        if (n > 0) target[n] = '\\0';
+        have_target = stat(path, &target_st) == 0;
+        log_line("km_diag: endpoint-node %s type=%s mode=%04o target=%s target_mode=%04o",
+                 path, S_ISLNK(st.st_mode) ? "symlink" :
+                 (S_ISCHR(st.st_mode) ? "char" : "other"),
+                 (unsigned)(st.st_mode & 07777), target[0] ? target : "-",
+                 have_target ? (unsigned)(target_st.st_mode & 07777) : 0);
+        found++;
+    }
+    closedir(dir);
+    log_line("km_diag: endpoint-node inventory %s: %d matching nodes", name, found);
+}
+
 static void scan_nodes(void)
 {
     DIR *dir = opendir("/dev");
@@ -174,8 +218,10 @@ static void scan_nodes(void)
         snprintf(node->name, sizeof node->name, "%s", entry->d_name);
         node->fd = -1;
         log_line("km_diag: USB node /dev/%s discovered", node->name);
-        if (strncmp(node->name, "ugen", 4) == 0)
+        if (strncmp(node->name, "ugen", 4) == 0) {
             inspect_ugen(node->name);
+            list_ugen_endpoint_nodes(node->name);
+        }
     }
     closedir(dir);
 }
